@@ -37,9 +37,76 @@ enum TuiMode {
     Live,
     GateOverlay,
     Summary,
+    CommandPrompt,
+    HelpOverlay,
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+#[derive(Debug, PartialEq, Eq)]
+enum MonitorCommand {
+    Help,
+    Status,
+    Live,
+    Summary,
+    Approve,
+    Reject,
+    Pause,
+    Cancel,
+    Refresh,
+    FocusSessions,
+    FocusPhases,
+    FocusLogs,
+    Session(String),
+    Phase(String),
+}
+
+fn parse_monitor_command(input: &str) -> Result<MonitorCommand, String> {
+    let trimmed = input.trim();
+    let trimmed = trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix(':'))
+        .unwrap_or(trimmed)
+        .trim();
+
+    if trimmed.is_empty() {
+        return Err("Empty command. Try /help.".to_string());
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let name = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let arg = parts.collect::<Vec<_>>().join(" ");
+
+    match name.as_str() {
+        "help" => Ok(MonitorCommand::Help),
+        "status" => Ok(MonitorCommand::Status),
+        "live" => Ok(MonitorCommand::Live),
+        "summary" => Ok(MonitorCommand::Summary),
+        "approve" => Ok(MonitorCommand::Approve),
+        "reject" => Ok(MonitorCommand::Reject),
+        "pause" => Ok(MonitorCommand::Pause),
+        "cancel" => Ok(MonitorCommand::Cancel),
+        "refresh" => Ok(MonitorCommand::Refresh),
+        "sessions" => Ok(MonitorCommand::FocusSessions),
+        "phases" => Ok(MonitorCommand::FocusPhases),
+        "logs" | "log" => Ok(MonitorCommand::FocusLogs),
+        "session" => {
+            if arg.is_empty() {
+                Err("Usage: /session <id-prefix|title-fragment>".to_string())
+            } else {
+                Ok(MonitorCommand::Session(arg))
+            }
+        }
+        "phase" => {
+            if arg.is_empty() {
+                Err("Usage: /phase <phase-name>".to_string())
+            } else {
+                Ok(MonitorCommand::Phase(arg))
+            }
+        }
+        _ => Err(format!("Unknown command '/{}'. Try /help.", name)),
+    }
+}
 
 /// Live-updating TUI monitor application.
 pub struct MonitorApp {
@@ -76,6 +143,10 @@ pub struct MonitorApp {
     line_buffer: String,
     /// Session ID associated with the current line buffer.
     line_buffer_session: String,
+    /// Slash-command input buffer.
+    command_input: String,
+    /// Last command/result message shown in the status bar.
+    status_message: Option<String>,
 }
 
 impl MonitorApp {
@@ -129,6 +200,8 @@ impl MonitorApp {
             preset_phase_names: vec![],
             line_buffer: String::new(),
             line_buffer_session: String::new(),
+            command_input: String::new(),
+            status_message: None,
         })
     }
 
@@ -182,6 +255,8 @@ impl MonitorApp {
             preset_phase_names: preset_phases,
             line_buffer: String::new(),
             line_buffer_session: String::new(),
+            command_input: String::new(),
+            status_message: None,
         })
     }
 
@@ -475,47 +550,69 @@ impl MonitorApp {
     }
 
     pub fn respond_gate(&mut self, response: GateResponse) {
+        let status_message = match &response {
+            GateResponse::Approve => "Gate approved".to_string(),
+            GateResponse::Reject => "Gate rejected".to_string(),
+            GateResponse::Edit(path) => format!("Gate sent back for edit: {}", path.display()),
+        };
         if let Some(responder) = self.pending_gate_responder.take() {
             let _ = responder.send(response);
         }
         self.pending_gate_display = None;
         self.mode = TuiMode::Live;
+        self.status_message = Some(status_message);
     }
 
     pub fn render(&self, frame: &mut Frame) {
         match self.mode {
             TuiMode::Summary => self.render_summary(frame),
+            TuiMode::HelpOverlay => {
+                self.render_live_shell(frame);
+                self.render_help_overlay(frame);
+            }
+            TuiMode::CommandPrompt => self.render_live_shell(frame),
             _ => {
-                let area = frame.size();
-
-                let outer = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(1), Constraint::Length(1)])
-                    .split(area);
-
-                let main_area = outer[0];
-                let status_area = outer[1];
-
-                let cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
-                    .split(main_area);
-
-                let left_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-                    .split(cols[0]);
-
-                self.render_sessions(frame, left_rows[0]);
-                self.render_phases(frame, left_rows[1]);
-                self.render_logs(frame, cols[1]);
-                self.render_statusbar(frame, status_area);
+                self.render_live_shell(frame);
 
                 if self.mode == TuiMode::GateOverlay {
                     self.render_gate_overlay(frame);
                 }
             }
         }
+    }
+
+    fn render_live_shell(&self, frame: &mut Frame) {
+        let area = frame.size();
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
+
+        let main_area = outer[0];
+        let status_area = outer[1];
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
+            .split(main_area);
+
+        let left_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(28),
+                Constraint::Length(3),
+                Constraint::Length(7),
+                Constraint::Min(8),
+            ])
+            .split(cols[0]);
+
+        self.render_sessions(frame, left_rows[0]);
+        self.render_command_prompt(frame, left_rows[1]);
+        self.render_session_details(frame, left_rows[2]);
+        self.render_phases(frame, left_rows[3]);
+        self.render_logs(frame, cols[1]);
+        self.render_statusbar(frame, status_area);
     }
 
     fn render_sessions(&self, frame: &mut Frame, area: Rect) {
@@ -601,6 +698,56 @@ impl MonitorApp {
                 .border_style(border_style),
         );
         frame.render_widget(list, area);
+    }
+
+    fn render_session_details(&self, frame: &mut Frame, area: Rect) {
+        let session = self.sessions.get(self.selected_session);
+
+        let content = if let Some(s) = session {
+            let branch = if s.workspace_branch.is_empty() {
+                "main workspace"
+            } else {
+                s.workspace_branch.as_str()
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(&s.status),
+                ]),
+                Line::from(vec![
+                    Span::styled("Control: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(s.control_action.as_deref().unwrap_or("none")),
+                ]),
+                Line::from(vec![
+                    Span::styled("Preset: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(&s.preset),
+                ]),
+                Line::from(vec![
+                    Span::styled("Branch: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(branch),
+                ]),
+                Line::from(vec![
+                    Span::styled("Worktree: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(truncate_path(
+                        &s.workspace_path,
+                        area.width.saturating_sub(12) as usize,
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled("Project: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(truncate_path(
+                        &s.project_path,
+                        area.width.saturating_sub(11) as usize,
+                    )),
+                ]),
+            ]
+        } else {
+            vec![Line::from("No session selected")]
+        };
+
+        let para = Paragraph::new(Text::from(content))
+            .block(Block::default().borders(Borders::ALL).title("DETAILS"));
+        frame.render_widget(para, area);
     }
 
     fn render_logs(&self, frame: &mut Frame, area: Rect) {
@@ -726,10 +873,16 @@ impl MonitorApp {
         let nav_text = match self.mode {
             TuiMode::GateOverlay => "[Y] approve  [N] reject",
             TuiMode::Summary => "[q] quit  [Tab] live",
+            TuiMode::CommandPrompt => "[Enter] run command  [Esc] close",
+            TuiMode::HelpOverlay => "[Esc] close  [/] command prompt",
             TuiMode::Live => match self.focus {
-                Panel::Sessions => "[q] quit  [↑↓] select session  [Tab] next panel  [r] refresh",
-                Panel::Phases => "[q] quit  [↑↓] select phase  [Esc] live view  [Tab] next panel",
-                Panel::Log => "[q] quit  [Tab] next panel  [r] refresh",
+                Panel::Sessions => {
+                    "[q] quit  [↑↓] select session  [p] pause  [c] cancel  [Tab] next panel  [r] refresh"
+                }
+                Panel::Phases => {
+                    "[q] quit  [↑↓] select phase  [p] pause  [c] cancel  [Esc] live view  [Tab] next panel"
+                }
+                Panel::Log => "[q] quit  [p] pause  [c] cancel  [Tab] next panel  [r] refresh",
             },
         };
 
@@ -739,7 +892,74 @@ impl MonitorApp {
             format!("{}  |  {}", nav_text, cost_part)
         };
 
+        let full_text = if let Some(control) = self
+            .sessions
+            .get(self.selected_session)
+            .and_then(|session| session.control_action.as_deref())
+        {
+            format!("{}  |  Control queued: {}", full_text, control)
+        } else {
+            full_text
+        };
+
+        let full_text = if let Some(msg) = &self.status_message {
+            format!("{}  |  {}", full_text, msg)
+        } else {
+            full_text
+        };
+
         let para = Paragraph::new(full_text).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(para, area);
+    }
+
+    fn render_command_prompt(&self, frame: &mut Frame, area: Rect) {
+        let (text, border_style) = if self.mode == TuiMode::CommandPrompt {
+            (
+                if self.command_input.is_empty() {
+                    "/".to_string()
+                } else {
+                    self.command_input.clone()
+                },
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            (
+                "Press / to enter a command".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+        let para = Paragraph::new(text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("COMMAND")
+                .border_style(border_style),
+        );
+        frame.render_widget(para, area);
+    }
+
+    fn render_help_overlay(&self, frame: &mut Frame) {
+        let area = centered_rect(frame.size(), 72, 16);
+        frame.render_widget(Clear, area);
+        let content = vec![
+            Line::from("/help      Show this command list"),
+            Line::from("/status    Show the current session/focus summary"),
+            Line::from("/live      Return to the live dashboard"),
+            Line::from("/summary   Show the session usage summary"),
+            Line::from("/approve   Approve the pending gate"),
+            Line::from("/reject    Reject the pending gate"),
+            Line::from("/pause     Pause the selected session"),
+            Line::from("/cancel    Cancel the selected session"),
+            Line::from("/refresh   Force a tick/refresh"),
+            Line::from("/sessions  Focus the sessions panel"),
+            Line::from("/phases    Focus the phases panel"),
+            Line::from("/logs      Focus the logs panel"),
+            Line::from("/session <id-prefix|title-fragment>"),
+            Line::from("/phase <phase-name-prefix>"),
+            Line::from(""),
+            Line::from("[Esc] close  [/] command prompt"),
+        ];
+        let para = Paragraph::new(Text::from(content))
+            .block(Block::default().borders(Borders::ALL).title("Commands"));
         frame.render_widget(para, area);
     }
 
@@ -916,6 +1136,211 @@ impl MonitorApp {
         self.phases.clear();
         self.last_seq = 0;
         self.selected_phase = None;
+        self.session_usage = None;
+    }
+
+    async fn request_selected_session_control(&mut self, action: &str) -> Result<()> {
+        let Some(session) = self.sessions.get_mut(self.selected_session) else {
+            return Ok(());
+        };
+
+        match session.status.as_str() {
+            "completed" | "canceled" => return Ok(()),
+            "running" => {
+                self.storage
+                    .request_session_control(&session.id, action)
+                    .await?;
+                session.control_action = Some(action.to_string());
+                session.control_requested_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            _ => {
+                let next_status = match action {
+                    "pause" => "paused",
+                    "cancel" => "canceled",
+                    _ => &session.status,
+                };
+                self.storage.clear_session_control(&session.id).await?;
+                self.storage
+                    .update_session_status(&session.id, next_status)
+                    .await?;
+                session.control_action = None;
+                session.control_requested_at = None;
+                session.status = next_status.to_string();
+            }
+        }
+
+        self.status_message = Some(format!(
+            "Session {} {}",
+            short_id(&session.id),
+            match action {
+                "pause" => "pause requested",
+                "cancel" => "cancel requested",
+                other => other,
+            }
+        ));
+
+        Ok(())
+    }
+
+    fn open_command_prompt(&mut self, prefill: &str) {
+        self.command_input = prefill.to_string();
+        self.mode = TuiMode::CommandPrompt;
+    }
+
+    fn set_focus(&mut self, panel: Panel) {
+        self.focus = panel;
+        self.mode = TuiMode::Live;
+    }
+
+    fn status_snapshot(&self) -> String {
+        let session = self.sessions.get(self.selected_session);
+        let session_label = session
+            .map(|s| format!("{} ({})", short_id(&s.id), s.status))
+            .unwrap_or_else(|| "none".to_string());
+        let focus = match self.focus {
+            Panel::Sessions => "sessions",
+            Panel::Phases => "phases",
+            Panel::Log => "logs",
+        };
+        let phase = if let Some(index) = self.selected_phase {
+            self.phases
+                .get(index)
+                .map(|p| p.phase.clone())
+                .unwrap_or_else(|| "live".to_string())
+        } else {
+            "live".to_string()
+        };
+        format!("Session: {} | Focus: {} | Phase: {}", session_label, focus, phase)
+    }
+
+    fn select_session_by_query(&mut self, query: &str) -> Result<String, String> {
+        let needle = query.to_ascii_lowercase();
+        let Some((index, session_id, feature_title)) =
+            self.sessions.iter().enumerate().find_map(|(index, session)| {
+                let matches = session.id.to_ascii_lowercase().starts_with(&needle)
+                    || session
+                        .feature_title
+                        .to_ascii_lowercase()
+                        .contains(&needle);
+                matches.then(|| (index, session.id.clone(), session.feature_title.clone()))
+            })
+        else {
+            return Err(format!("No session matches '{}'", query));
+        };
+
+        self.selected_session = index;
+        self.reset_for_session();
+        Ok(format!(
+            "Selected session {} ({})",
+            short_id(&session_id),
+            truncate(&feature_title, 24)
+        ))
+    }
+
+    fn select_phase_by_query(&mut self, query: &str) -> Result<String, String> {
+        let needle = query.to_ascii_lowercase();
+        let Some((index, phase)) = self.phases.iter().enumerate().find(|(_, phase)| {
+            phase.phase.to_ascii_lowercase().starts_with(&needle)
+        }) else {
+            return Err(format!("No phase matches '{}'", query));
+        };
+
+        self.selected_phase = Some(index);
+        self.focus = Panel::Phases;
+        self.mode = TuiMode::Live;
+        Ok(format!("Selected phase {}", phase.phase))
+    }
+
+    async fn execute_command(&mut self, command: MonitorCommand) -> Result<String, String> {
+        match command {
+            MonitorCommand::Help => {
+                self.mode = TuiMode::HelpOverlay;
+                Ok("Help opened".to_string())
+            }
+            MonitorCommand::Status => {
+                self.mode = TuiMode::Live;
+                Ok(self.status_snapshot())
+            }
+            MonitorCommand::Live => {
+                self.mode = TuiMode::Live;
+                Ok("Returned to live dashboard".to_string())
+            }
+            MonitorCommand::Summary => {
+                if self.session_usage.is_some() {
+                    self.mode = TuiMode::Summary;
+                    Ok("Summary opened".to_string())
+                } else {
+                    self.mode = TuiMode::Live;
+                    Err("No session summary available yet".to_string())
+                }
+            }
+            MonitorCommand::Approve => {
+                if self.pending_gate_responder.is_some() {
+                    self.respond_gate(GateResponse::Approve);
+                    Ok("Gate approved".to_string())
+                } else {
+                    Err("No pending gate to approve".to_string())
+                }
+            }
+            MonitorCommand::Reject => {
+                if self.pending_gate_responder.is_some() {
+                    self.respond_gate(GateResponse::Reject);
+                    Ok("Gate rejected".to_string())
+                } else {
+                    Err("No pending gate to reject".to_string())
+                }
+            }
+            MonitorCommand::Pause => {
+                self.mode = TuiMode::Live;
+                self.request_selected_session_control("pause")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok("Pause requested".to_string())
+            }
+            MonitorCommand::Cancel => {
+                self.mode = TuiMode::Live;
+                self.request_selected_session_control("cancel")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok("Cancel requested".to_string())
+            }
+            MonitorCommand::Refresh => {
+                self.mode = TuiMode::Live;
+                self.tick().await.map_err(|e| e.to_string())?;
+                Ok("Refreshed".to_string())
+            }
+            MonitorCommand::FocusSessions => {
+                self.set_focus(Panel::Sessions);
+                Ok("Focused sessions".to_string())
+            }
+            MonitorCommand::FocusPhases => {
+                self.set_focus(Panel::Phases);
+                Ok("Focused phases".to_string())
+            }
+            MonitorCommand::FocusLogs => {
+                self.set_focus(Panel::Log);
+                Ok("Focused logs".to_string())
+            }
+            MonitorCommand::Session(query) => self.select_session_by_query(&query),
+            MonitorCommand::Phase(query) => self.select_phase_by_query(&query),
+        }
+    }
+
+    async fn submit_command(&mut self) {
+        let raw = std::mem::take(&mut self.command_input);
+        match parse_monitor_command(&raw) {
+            Ok(command) => match self.execute_command(command).await {
+                Ok(message) => self.status_message = Some(message),
+                Err(err) => {
+                    self.mode = TuiMode::Live;
+                    self.status_message = Some(err);
+                }
+            },
+            Err(err) => {
+                self.mode = TuiMode::Live;
+                self.status_message = Some(err);
+            }
+        }
     }
 }
 
@@ -1058,6 +1483,12 @@ async fn tui_event_loop(
                     KeyCode::Tab => app.toggle_focus(),
                     // Esc in Phases panel clears phase selection (back to live view).
                     KeyCode::Esc => app.selected_phase = None,
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        app.request_selected_session_control("pause").await?;
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        app.request_selected_session_control("cancel").await?;
+                    }
                     KeyCode::Char('r') => {
                         app.tick().await?;
                     }
@@ -1104,6 +1535,25 @@ async fn tui_integrated_event_loop(
                     TuiMode::Summary => match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => break,
                         KeyCode::Tab => app.mode = TuiMode::Live,
+                        KeyCode::Char('/') | KeyCode::Char(':') => app.open_command_prompt("/"),
+                        KeyCode::Esc => app.mode = TuiMode::Live,
+                        _ => {}
+                    },
+                    TuiMode::HelpOverlay => match key.code {
+                        KeyCode::Esc => app.mode = TuiMode::Live,
+                        KeyCode::Char('/') | KeyCode::Char(':') => app.open_command_prompt("/"),
+                        _ => {}
+                    },
+                    TuiMode::CommandPrompt => match key.code {
+                        KeyCode::Esc => {
+                            app.command_input.clear();
+                            app.mode = TuiMode::Live;
+                        }
+                        KeyCode::Backspace => {
+                            app.command_input.pop();
+                        }
+                        KeyCode::Enter => app.submit_command().await,
+                        KeyCode::Char(ch) => app.command_input.push(ch),
                         _ => {}
                     },
                     TuiMode::Live => match key.code {
@@ -1112,9 +1562,16 @@ async fn tui_integrated_event_loop(
                         KeyCode::Down => app.handle_down(),
                         KeyCode::Tab => app.toggle_focus(),
                         KeyCode::Esc => app.selected_phase = None,
+                        KeyCode::Char('p') | KeyCode::Char('P') => {
+                            app.request_selected_session_control("pause").await?;
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            app.request_selected_session_control("cancel").await?;
+                        }
                         KeyCode::Char('r') => {
                             app.tick().await?;
                         }
+                        KeyCode::Char('/') | KeyCode::Char(':') => app.open_command_prompt("/"),
                         _ => {}
                     },
                 }
@@ -1138,6 +1595,7 @@ fn status_icon(status: &str) -> &'static str {
         "completed" => "✓",
         "failed" => "✗",
         "paused" => "⏸",
+        "canceled" => "■",
         "pending" => "·",
         _ => "○",
     }
@@ -1153,6 +1611,27 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…", &s[..max.saturating_sub(1)])
     }
+}
+
+fn truncate_path(path: &str, max: usize) -> String {
+    if path.chars().count() <= max {
+        return path.to_string();
+    }
+    if max <= 3 {
+        return "...".to_string();
+    }
+
+    let keep = (max.saturating_sub(3)) / 2;
+    let start: String = path.chars().take(keep).collect();
+    let end: String = path
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{}...{}", start, end)
 }
 
 fn phase_dur_str(started_at: &Option<String>, completed_at: &Option<String>) -> String {
@@ -1174,4 +1653,34 @@ fn uuid_simple() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}-{}", t.as_millis(), t.subsec_nanos())
+}
+
+fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
+    let width = (area.width * width_pct / 100).max(32);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_monitor_command, MonitorCommand};
+
+    #[test]
+    fn parse_simple_command() {
+        assert_eq!(parse_monitor_command("/status"), Ok(MonitorCommand::Status));
+    }
+
+    #[test]
+    fn parse_command_with_argument() {
+        assert_eq!(
+            parse_monitor_command("/session auth"),
+            Ok(MonitorCommand::Session("auth".to_string()))
+        );
+    }
+
+    #[test]
+    fn reject_unknown_command() {
+        assert!(parse_monitor_command("/nope").is_err());
+    }
 }

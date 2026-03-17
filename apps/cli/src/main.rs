@@ -232,6 +232,27 @@ enum SessionCommands {
         /// Session ID to resume.
         id: String,
     },
+    /// Mark a session as paused in storage.
+    Pause {
+        /// Session ID to pause.
+        id: String,
+    },
+    /// Cancel a session in storage.
+    Cancel {
+        /// Session ID to cancel.
+        id: String,
+    },
+    /// Rerun a session from a specific phase.
+    Rerun {
+        /// Session ID to rerun.
+        id: String,
+        /// Phase name to restart from (e.g. spec, plan, implement).
+        #[arg(long)]
+        from: Option<String>,
+        /// Restart from the first failed phase.
+        #[arg(long)]
+        failed: bool,
+    },
 }
 
 // ── agent subcommands ─────────────────────────────────────────────────────────
@@ -404,6 +425,11 @@ async fn main() -> Result<()> {
             SessionCommands::List => cmd_session_list().await?,
             SessionCommands::Show { id } => cmd_session_show(&id).await?,
             SessionCommands::Resume { id } => cmd_session_resume(&id).await?,
+            SessionCommands::Pause { id } => cmd_session_pause(&id).await?,
+            SessionCommands::Cancel { id } => cmd_session_cancel(&id).await?,
+            SessionCommands::Rerun { id, from, failed } => {
+                cmd_session_rerun(&id, from.as_deref(), failed).await?
+            }
         },
 
         Commands::Agent(sub) => match sub {
@@ -976,14 +1002,18 @@ async fn cmd_session_list() -> Result<()> {
         println!("No sessions found.");
     } else {
         println!(
-            "{:<38} {:<8} {:<30} STATUS",
-            "SESSION ID", "PRESET", "FEATURE"
+            "{:<38} {:<8} {:<24} {:<10} CONTROL",
+            "SESSION ID", "PRESET", "FEATURE", "STATUS"
         );
-        println!("{}", "-".repeat(88));
+        println!("{}", "-".repeat(104));
         for s in sessions {
             println!(
-                "{:<38} {:<8} {:<30} {}",
-                s.id, s.preset, s.feature_title, s.status
+                "{:<38} {:<8} {:<24} {:<10} {}",
+                s.id,
+                s.preset,
+                s.feature_title,
+                s.status,
+                s.control_action.as_deref().unwrap_or("-")
             );
         }
     }
@@ -999,6 +1029,13 @@ async fn cmd_session_show(id: &str) -> Result<()> {
             println!("Feature:  {}", s.feature_title);
             println!("Preset:   {}", s.preset);
             println!("Status:   {}", s.status);
+            println!(
+                "Control:  {}",
+                s.control_action.as_deref().unwrap_or("(none)")
+            );
+            if let Some(requested_at) = &s.control_requested_at {
+                println!("Queued:   {}", requested_at);
+            }
             println!("Project:  {}", s.project_path);
             println!("Workspace: {}", s.workspace_path);
             println!(
@@ -1049,6 +1086,96 @@ async fn cmd_session_resume(id: &str) -> Result<()> {
     println!(
         "\nSession {} resumed and completed.\nWorkspace: {}\nBranch: {}",
         id,
+        session.workspace_path,
+        if session.workspace_branch.is_empty() {
+            "(shared project tree)"
+        } else {
+            &session.workspace_branch
+        }
+    );
+    Ok(())
+}
+
+/// `koklo session pause <id>`
+async fn cmd_session_pause(id: &str) -> Result<()> {
+    let storage = open_storage().await?;
+    let session = storage
+        .get_session(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    if session.status == "completed" || session.status == "canceled" {
+        anyhow::bail!(
+            "Session {} cannot be paused from status '{}'",
+            id,
+            session.status
+        );
+    }
+    if session.status == "running" {
+        storage.request_session_control(id, "pause").await?;
+        println!(
+            "Pause requested for session {}. It will stop after the current phase or gate boundary.",
+            id
+        );
+    } else {
+        storage.clear_session_control(id).await?;
+        storage.update_session_status(id, "paused").await?;
+        println!("Session {} marked as paused.", id);
+    }
+    Ok(())
+}
+
+/// `koklo session cancel <id>`
+async fn cmd_session_cancel(id: &str) -> Result<()> {
+    let storage = open_storage().await?;
+    let session = storage
+        .get_session(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    if session.status == "completed" {
+        anyhow::bail!("Session {} is already completed and cannot be canceled", id);
+    }
+    if session.status == "running" {
+        storage.request_session_control(id, "cancel").await?;
+        println!(
+            "Cancel requested for session {}. It will stop after the current phase or gate boundary.",
+            id
+        );
+    } else {
+        storage.clear_session_control(id).await?;
+        storage.update_session_status(id, "canceled").await?;
+        println!("Session {} marked as canceled.", id);
+    }
+    Ok(())
+}
+
+/// `koklo session rerun <id> [--from <phase> | --failed]`
+async fn cmd_session_rerun(id: &str, from: Option<&str>, failed: bool) -> Result<()> {
+    if from.is_some() == failed {
+        anyhow::bail!("Choose exactly one of --from <phase> or --failed");
+    }
+
+    let storage = open_storage().await?;
+    let session = storage
+        .get_session(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    let orchestrator = build_orchestrator(Some(PathBuf::from(&session.project_path)), None).await?;
+
+    if failed {
+        orchestrator.rerun_failed(id).await?;
+        println!("Session {} rerun from its first failed phase.", id);
+    } else {
+        let phase = from.expect("validated above");
+        orchestrator.rerun_from_phase(id, phase).await?;
+        println!("Session {} rerun from phase '{}'.", id, phase);
+    }
+
+    let session = storage
+        .get_session(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Session not found after rerun: {}", id))?;
+    println!(
+        "Workspace: {}\nBranch: {}",
         session.workspace_path,
         if session.workspace_branch.is_empty() {
             "(shared project tree)"

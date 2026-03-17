@@ -146,6 +146,21 @@ enum PhaseRunOutcome {
     },
 }
 
+enum SessionControlAction {
+    Pause,
+    Cancel,
+}
+
+impl SessionControlAction {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pause" => Some(Self::Pause),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
 impl PipelineConfig {
     /// Select the provider for a given agent.
     ///
@@ -398,9 +413,16 @@ impl PipelineOrchestrator {
             .run_phases_from(&session, preset, &HashSet::new())
             .await?;
         if !completed {
+            let status = self
+                .storage
+                .get_session(&session_id)
+                .await?
+                .map(|session| session.status)
+                .unwrap_or_else(|| "stopped".to_string());
             tracing::info!(
-                "Pipeline paused awaiting user input: session={}",
-                session_id
+                "Pipeline stopped early: session={} status={}",
+                session_id,
+                status
             );
             return Ok(session_id);
         }
@@ -459,6 +481,7 @@ impl PipelineOrchestrator {
             completed.len()
         );
 
+        self.storage.clear_session_control(session_id).await?;
         self.storage
             .update_session_status(session_id, "running")
             .await?;
@@ -473,6 +496,70 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
+    /// Resume a session from a specific phase, clearing persisted state for that phase and later.
+    pub async fn rerun_from_phase(&self, session_id: &str, phase_name: &str) -> Result<()> {
+        let mut session = self
+            .storage
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+        let workspace = self.ensure_session_workspace(&session).await?;
+        session.workspace_path = workspace.root.to_string_lossy().into_owned();
+        session.workspace_branch = workspace.branch.clone();
+
+        let preset = PresetKind::parse(&session.preset).unwrap_or(PresetKind::Sdd);
+        let ordered_phases = phases_for_preset(preset);
+        let start_index = ordered_phases
+            .iter()
+            .position(|(phase, _)| phase.to_string() == phase_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Phase '{}' does not exist in preset '{}'",
+                    phase_name,
+                    preset
+                )
+            })?;
+
+        let completed: HashSet<String> = ordered_phases[..start_index]
+            .iter()
+            .map(|(phase, _)| phase.to_string())
+            .collect();
+        let reset: Vec<String> = ordered_phases[start_index..]
+            .iter()
+            .map(|(phase, _)| phase.to_string())
+            .collect();
+
+        self.storage.reset_phases(session_id, &reset).await?;
+        self.storage.clear_session_control(session_id).await?;
+        self.storage
+            .update_session_status(session_id, "running")
+            .await?;
+
+        let finished = self.run_phases_from(&session, preset, &completed).await?;
+        if !finished {
+            tracing::info!("Session {} paused awaiting user input", session_id);
+            return Ok(());
+        }
+
+        self.storage
+            .update_session_status(session_id, "completed")
+            .await?;
+        Ok(())
+    }
+
+    /// Resume from the first failed phase recorded for the session.
+    pub async fn rerun_failed(&self, session_id: &str) -> Result<()> {
+        let phases = self.storage.get_phases_for_session(session_id).await?;
+        let failed = phases
+            .iter()
+            .find(|phase| phase.status == "failed")
+            .map(|phase| phase.phase.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Session {} has no failed phase to rerun", session_id)
+            })?;
+        self.rerun_from_phase(session_id, &failed).await
+    }
+
     // ── internals ─────────────────────────────────────────────────────────────
 
     async fn run_phases_from(
@@ -484,6 +571,9 @@ impl PipelineOrchestrator {
         let phases = phases_for_preset(preset);
 
         for (phase, agent_name) in &phases {
+            if self.handle_pending_session_control(session, None).await? {
+                return Ok(false);
+            }
             if skip.contains(&phase.to_string()) {
                 tracing::info!("Skipping completed phase: {}", phase);
                 continue;
@@ -511,6 +601,13 @@ impl PipelineOrchestrator {
                 cost,
             } = phase_outcome;
 
+            if self
+                .handle_pending_session_control(session, Some(*phase))
+                .await?
+            {
+                return Ok(false);
+            }
+
             if *phase == Phase::Review {
                 if let Some(gh) = &self.config.github {
                     match self
@@ -535,6 +632,13 @@ impl PipelineOrchestrator {
             }
 
             self.gate(&session.id, *phase, Some(usage), cost).await?;
+
+            if self
+                .handle_pending_session_control(session, Some(*phase))
+                .await?
+            {
+                return Ok(false);
+            }
         }
 
         Ok(true)
@@ -750,6 +854,54 @@ impl PipelineOrchestrator {
                 anyhow::bail!("Gate rejected at phase '{}' — session paused", phase)
             }
         }
+    }
+
+    async fn handle_pending_session_control(
+        &self,
+        session: &Session,
+        phase: Option<Phase>,
+    ) -> Result<bool> {
+        let Some(action) = self.storage.take_session_control(&session.id).await? else {
+            return Ok(false);
+        };
+        let Some(action) = SessionControlAction::parse(&action) else {
+            tracing::warn!(
+                "Ignoring unknown control action '{}' for {}",
+                action,
+                session.id
+            );
+            return Ok(false);
+        };
+
+        let (status, message) = match action {
+            SessionControlAction::Pause => (
+                "paused",
+                format!(
+                    "Session paused{} by user request.",
+                    phase
+                        .map(|phase| format!(" after phase '{}'", phase))
+                        .unwrap_or_else(|| " before next phase".to_string())
+                ),
+            ),
+            SessionControlAction::Cancel => (
+                "canceled",
+                format!(
+                    "Session canceled{} by user request.",
+                    phase
+                        .map(|phase| format!(" after phase '{}'", phase))
+                        .unwrap_or_else(|| " before next phase".to_string())
+                ),
+            ),
+        };
+
+        self.storage
+            .update_session_status(&session.id, status)
+            .await?;
+        self.storage
+            .record_agent_log(&session.id, "", "system", &message)
+            .await?;
+        tracing::info!("{} session={}", message, session.id);
+        Ok(true)
     }
 
     async fn ensure_session_workspace(&self, session: &Session) -> Result<SessionWorkspace> {
@@ -1207,6 +1359,92 @@ mod tests {
     fn test_phase_ordering_speckit() {
         let phases = presets::phases_for_preset(PresetKind::SpecKit);
         assert_eq!(phases.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_rerun_failed_requires_failed_phase() {
+        let config = make_test_config(Arc::new(OllamaProvider::from_env()), HashMap::new());
+        let storage = Arc::new(SessionManager::in_memory().await.unwrap());
+        let session = storage.create_session("feature", "sdd", "").await.unwrap();
+        let orchestrator = PipelineOrchestrator {
+            config,
+            storage,
+            bus: EventBus::new(16),
+            gate_handler: Arc::new(StdinGateHandler),
+        };
+
+        let err = orchestrator.rerun_failed(&session.id).await.unwrap_err();
+        assert!(err.to_string().contains("no failed phase"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pending_pause_control_marks_session_paused() {
+        let config = make_test_config(Arc::new(OllamaProvider::from_env()), HashMap::new());
+        let storage = Arc::new(SessionManager::in_memory().await.unwrap());
+        let session = storage.create_session("feature", "sdd", "").await.unwrap();
+        storage
+            .update_session_status(&session.id, "running")
+            .await
+            .unwrap();
+        storage
+            .request_session_control(&session.id, "pause")
+            .await
+            .unwrap();
+        let orchestrator = PipelineOrchestrator {
+            config,
+            storage: Arc::clone(&storage),
+            bus: EventBus::new(16),
+            gate_handler: Arc::new(StdinGateHandler),
+        };
+
+        assert!(orchestrator
+            .handle_pending_session_control(&session, Some(Phase::Spec))
+            .await
+            .unwrap());
+        assert_eq!(
+            storage
+                .get_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "paused"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_pending_cancel_control_marks_session_canceled() {
+        let config = make_test_config(Arc::new(OllamaProvider::from_env()), HashMap::new());
+        let storage = Arc::new(SessionManager::in_memory().await.unwrap());
+        let session = storage.create_session("feature", "sdd", "").await.unwrap();
+        storage
+            .update_session_status(&session.id, "running")
+            .await
+            .unwrap();
+        storage
+            .request_session_control(&session.id, "cancel")
+            .await
+            .unwrap();
+        let orchestrator = PipelineOrchestrator {
+            config,
+            storage: Arc::clone(&storage),
+            bus: EventBus::new(16),
+            gate_handler: Arc::new(StdinGateHandler),
+        };
+
+        assert!(orchestrator
+            .handle_pending_session_control(&session, None)
+            .await
+            .unwrap());
+        assert_eq!(
+            storage
+                .get_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "canceled"
+        );
     }
 
     #[test]

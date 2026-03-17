@@ -11,6 +11,7 @@ pub enum SessionStatus {
     Pending,
     Running,
     Paused,
+    Canceled,
     Completed,
     Failed,
 }
@@ -21,6 +22,7 @@ impl std::fmt::Display for SessionStatus {
             SessionStatus::Pending => write!(f, "pending"),
             SessionStatus::Running => write!(f, "running"),
             SessionStatus::Paused => write!(f, "paused"),
+            SessionStatus::Canceled => write!(f, "canceled"),
             SessionStatus::Completed => write!(f, "completed"),
             SessionStatus::Failed => write!(f, "failed"),
         }
@@ -50,6 +52,9 @@ pub struct Session {
     pub workspace_path: String,
     /// Dedicated branch attached to the session workspace when Git isolation is available.
     pub workspace_branch: String,
+    /// Pending cooperative control action requested by the user (`pause` or `cancel`).
+    pub control_action: Option<String>,
+    pub control_requested_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -327,6 +332,22 @@ impl SessionManager {
                 .await?;
         }
 
+        // Migration 008 — cooperative session control actions.
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 8")
+                .fetch_one(&self.pool)
+                .await?;
+        if count == 0 {
+            sqlx::query(include_str!("../migrations/008_session_control.sql"))
+                .execute(&self.pool)
+                .await?;
+            let now = Utc::now().to_rfc3339();
+            sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES (8, ?)")
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -363,6 +384,8 @@ impl SessionManager {
             project_path: project_path.to_string(),
             workspace_path: project_path.to_string(),
             workspace_branch: String::new(),
+            control_action: None,
+            control_requested_at: None,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -391,7 +414,7 @@ impl SessionManager {
 
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let row = sqlx::query_as::<_, Session>(
-            "SELECT id, feature_title, status, preset, project_path, workspace_path, workspace_branch, created_at, updated_at \
+            "SELECT id, feature_title, status, preset, project_path, workspace_path, workspace_branch, control_action, control_requested_at, created_at, updated_at \
              FROM sessions WHERE id = ?",
         )
         .bind(id)
@@ -402,7 +425,7 @@ impl SessionManager {
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
         let rows = sqlx::query_as::<_, Session>(
-            "SELECT id, feature_title, status, preset, project_path, workspace_path, workspace_branch, created_at, updated_at \
+            "SELECT id, feature_title, status, preset, project_path, workspace_path, workspace_branch, control_action, control_requested_at, created_at, updated_at \
              FROM sessions ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -413,7 +436,7 @@ impl SessionManager {
     /// List sessions for a specific project root path, most recent first.
     pub async fn list_sessions_for_project(&self, path: &str) -> Result<Vec<Session>> {
         let rows = sqlx::query_as::<_, Session>(
-            "SELECT id, feature_title, status, preset, project_path, workspace_path, workspace_branch, created_at, updated_at \
+            "SELECT id, feature_title, status, preset, project_path, workspace_path, workspace_branch, control_action, control_requested_at, created_at, updated_at \
              FROM sessions WHERE project_path = ? ORDER BY created_at DESC",
         )
         .bind(path)
@@ -431,6 +454,45 @@ impl SessionManager {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn request_session_control(&self, id: &str, action: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE sessions SET control_action = ?, control_requested_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(action)
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_session_control(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE sessions SET control_action = NULL, control_requested_at = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn take_session_control(&self, id: &str) -> Result<Option<String>> {
+        let action: Option<String> =
+            sqlx::query_scalar("SELECT control_action FROM sessions WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        if action.is_some() {
+            self.clear_session_control(id).await?;
+        }
+        Ok(action)
     }
 
     pub async fn create_phase_record(&self, session_id: &str, phase: &str) -> Result<PhaseRecord> {
@@ -478,12 +540,49 @@ impl SessionManager {
     pub async fn get_phases_for_session(&self, session_id: &str) -> Result<Vec<PhaseRecord>> {
         let rows = sqlx::query_as::<_, PhaseRecord>(
             "SELECT id, session_id, phase, status, started_at, completed_at, error \
-             FROM phases WHERE session_id = ?",
+             FROM phases WHERE session_id = ? ORDER BY started_at ASC, rowid ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Remove persisted records for the given session phases so they can be rerun cleanly.
+    pub async fn reset_phases(&self, session_id: &str, phases: &[String]) -> Result<()> {
+        for phase in phases {
+            sqlx::query("DELETE FROM phases WHERE session_id = ? AND phase = ?")
+                .bind(session_id)
+                .bind(phase)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM artifacts WHERE session_id = ? AND phase = ?")
+                .bind(session_id)
+                .bind(phase)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM agent_logs WHERE session_id = ? AND phase = ?")
+                .bind(session_id)
+                .bind(phase)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM usage_records WHERE session_id = ? AND phase = ?")
+                .bind(session_id)
+                .bind(phase)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM gate_decisions WHERE session_id = ? AND phase = ?")
+                .bind(session_id)
+                .bind(phase)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM agent_outputs WHERE session_id = ? AND phase = ?")
+                .bind(session_id)
+                .bind(phase)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Record a pipeline artifact in the database.
@@ -824,6 +923,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_control_roundtrip() {
+        let mgr = SessionManager::in_memory().await.unwrap();
+        let session = mgr.create_session("control test", "sdd", "").await.unwrap();
+
+        mgr.request_session_control(&session.id, "pause")
+            .await
+            .unwrap();
+        assert_eq!(
+            mgr.take_session_control(&session.id).await.unwrap(),
+            Some("pause".to_string())
+        );
+        assert_eq!(mgr.take_session_control(&session.id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn test_phase_records() {
         let mgr = SessionManager::in_memory().await.unwrap();
         let session = mgr.create_session("test feature", "sdd", "").await.unwrap();
@@ -836,6 +950,69 @@ mod tests {
         let phases = mgr.get_phases_for_session(&session.id).await.unwrap();
         assert_eq!(phases.len(), 1);
         assert_eq!(phases[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn test_reset_phases_removes_phase_data() {
+        let mgr = SessionManager::in_memory().await.unwrap();
+        let session = mgr.create_session("reset test", "sdd", "").await.unwrap();
+        let phase = mgr.create_phase_record(&session.id, "spec").await.unwrap();
+        mgr.complete_phase(&phase.id, "failed", Some("boom"))
+            .await
+            .unwrap();
+        mgr.record_artifact(&session.id, "spec", "/tmp/spec.md", 12)
+            .await
+            .unwrap();
+        mgr.record_agent_log(&session.id, "spec", "pm", "log")
+            .await
+            .unwrap();
+        mgr.record_gate_decision(&session.id, "spec", "reject", None)
+            .await
+            .unwrap();
+        mgr.record_agent_output(&session.id, "spec", "pm", "output")
+            .await
+            .unwrap();
+        mgr.record_usage(UsageRecordInput {
+            session_id: &session.id,
+            phase: "spec",
+            agent_name: "pm",
+            provider: "test",
+            model: None,
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            cost_usd: None,
+            cost_kind: "free",
+        })
+        .await
+        .unwrap();
+
+        mgr.reset_phases(&session.id, &["spec".to_string()])
+            .await
+            .unwrap();
+
+        assert!(mgr
+            .get_phases_for_session(&session.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(mgr.list_artifacts(&session.id).await.unwrap().is_empty());
+        assert!(mgr
+            .get_agent_logs_for_session(&session.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(mgr
+            .get_session_usage_summary(&session.id)
+            .await
+            .unwrap()
+            .phases
+            .is_empty());
+        assert!(mgr
+            .search_outputs("output")
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|row| row.session_id != session.id));
     }
 
     #[tokio::test]
